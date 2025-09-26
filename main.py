@@ -4,14 +4,42 @@ import hashlib
 import time
 from flask import Flask, request, jsonify
 import requests
-
+from dotenv import load_dotenv
+load_dotenv()
 # --- Configuration (from environment variables) ---
 SLACK_SIGNING_SECRET = os.environ.get("SLACK_SIGNING_SECRET")
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN") # Needed for getting message permalink
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 GITHUB_REPO = os.environ.get("GITHUB_REPO") # e.g., "your-username/your-repo"
 
+
+
 app = Flask(__name__)
+def get_user_info(user_id):
+    """Gets a user's real name from their Slack ID."""
+    url = "https://slack.com/api/users.info"
+    headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
+    params = {"user": user_id}
+    response = requests.get(url, headers=headers, params=params)
+    if response.ok:
+        data = response.json()
+        if data.get("ok"):
+            # Return the user's real name, or their display name as a fallback
+            return data["user"]["profile"].get("real_name", data["user"]["profile"].get("display_name"))
+    return None
+
+def get_channel_info(channel_id):
+    """Gets a channel's name from its ID."""
+    url = "https://slack.com/api/conversations.info"
+    headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
+    params = {"channel": channel_id}
+    response = requests.get(url, headers=headers, params=params)
+    if response.ok:
+        data = response.json()
+        if data.get("ok"):
+            return data["channel"].get("name")
+    return None
+
 
 # Note: The verify_slack_request function remains the same as in the previous answer.
 # ... (include the verify_slack_request function here) ...
@@ -40,37 +68,45 @@ def get_message_permalink(channel_id, message_ts):
 def build_mcp_from_slack_event(event):
     """
     Translates a raw Slack event into our internal Model-Context Protocol object.
-    This is the heart of the "Protocol" implementation.
     """
     text = event.get('text', '')
     if not text.upper().startswith("ISSUE:"):
         return None
 
     title = text[6:].strip()
+    user_id = event.get('user')
     channel_id = event.get('channel')
     message_ts = event.get('ts')
-    
+
+    # --- NEW: Fetch descriptive names ---
+    user_name = get_user_info(user_id) or user_id
+    channel_name = get_channel_info(channel_id) or channel_id
     permalink = get_message_permalink(channel_id, message_ts)
+
+    # --- UPDATED: New body_template with real names ---
+    issue_body = (
+        f"**Description:**\n{title}\n\n"
+        f"--- \n"
+        f"### Slack Context\n"
+        f"- **Reporter:** {user_name} (`{user_id}`)\n"
+        f"- **Channel:** #{channel_name} (`{channel_id}`)\n"
+        f"- **[View Original Conversation]({permalink})**"
+    )
 
     mcp_object = {
         "source_system": "slack",
         "context": {
             "event_type": "channel_message",
-            "user_id": event.get('user'),
+            "user_id": user_id,
+            "user_name": user_name, # Storing the real name
             "channel_id": channel_id,
+            "channel_name": channel_name, # Storing the real name
             "timestamp": message_ts,
             "permalink": permalink
         },
         "model": {
             "title": title,
-            "body_template": (
-                f"Issue reported from Slack.\n\n"
-                f"**Details:**\n> {title}\n\n"
-                f"**Context:**\n"
-                f"- **Reporter:** <@{event.get('user')}>\n"
-                f"- **Channel:** <#{channel_id}>\n"
-                f"- **[Link to Conversation]({permalink})**"
-            ),
+            "body_template": issue_body, # Using the new descriptive body
             "suggested_labels": ["bug", "from-slack"]
         }
     }
